@@ -570,7 +570,7 @@ _Search3:
 			*op++ = (BYTE) lastRun;
 		} else
 			*op++ = (BYTE)(lastRun<<ML_BITS);
-		LZ4_memcpy(op, anchor, iend - anchor);
+		memcpy(op, anchor, iend - anchor);
 		op += iend - anchor;
 	}
 
@@ -603,6 +603,188 @@ static int LZ4_compress_HC_extStateHC(
 	else
 		return LZ4HC_compress_generic(ctx, src, dst,
 			srcSize, maxDstSize, compressionLevel, noLimit);
+}
+
+int LZ4_compress_HC(const char *src, char *dst, int srcSize,
+	int maxDstSize, int compressionLevel, void *wrkmem)
+{
+	return LZ4_compress_HC_extStateHC(wrkmem, src, dst,
+		srcSize, maxDstSize, compressionLevel);
+}
+EXPORT_SYMBOL(LZ4_compress_HC);
+
+/**************************************
+ *	Streaming Functions
+ **************************************/
+void LZ4_resetStreamHC(LZ4_streamHC_t *LZ4_streamHCPtr, int compressionLevel)
+{
+	LZ4_streamHCPtr->internal_donotuse.base = NULL;
+	LZ4_streamHCPtr->internal_donotuse.compressionLevel = (unsigned int)compressionLevel;
+}
+
+int LZ4_loadDictHC(LZ4_streamHC_t *LZ4_streamHCPtr,
+	const char *dictionary,
+	int dictSize)
+{
+	LZ4HC_CCtx_internal *ctxPtr = &LZ4_streamHCPtr->internal_donotuse;
+
+	if (dictSize > 64 * KB) {
+		dictionary += dictSize - 64 * KB;
+		dictSize = 64 * KB;
+	}
+	LZ4HC_init(ctxPtr, (const BYTE *)dictionary);
+	if (dictSize >= 4)
+		LZ4HC_Insert(ctxPtr, (const BYTE *)dictionary + (dictSize - 3));
+	ctxPtr->end = (const BYTE *)dictionary + dictSize;
+	return dictSize;
+}
+EXPORT_SYMBOL(LZ4_loadDictHC);
+
+/* compression */
+
+static void LZ4HC_setExternalDict(
+	LZ4HC_CCtx_internal *ctxPtr,
+	const BYTE *newBlock)
+{
+	if (ctxPtr->end >= ctxPtr->base + 4) {
+		/* Referencing remaining dictionary content */
+		LZ4HC_Insert(ctxPtr, ctxPtr->end - 3);
+	}
+
+	/*
+	 * Only one memory segment for extDict,
+	 * so any previous extDict is lost at this stage
+	 */
+	ctxPtr->lowLimit	= ctxPtr->dictLimit;
+	ctxPtr->dictLimit = (U32)(ctxPtr->end - ctxPtr->base);
+	ctxPtr->dictBase	= ctxPtr->base;
+	ctxPtr->base = newBlock - ctxPtr->dictLimit;
+	ctxPtr->end	= newBlock;
+	/* match referencing will resume from there */
+	ctxPtr->nextToUpdate = ctxPtr->dictLimit;
+}
+EXPORT_SYMBOL(LZ4HC_setExternalDict);
+
+static int LZ4_compressHC_continue_generic(
+	LZ4_streamHC_t *LZ4_streamHCPtr,
+	const char *source,
+	char *dest,
+	int inputSize,
+	int maxOutputSize,
+	limitedOutput_directive limit)
+{
+	LZ4HC_CCtx_internal *ctxPtr = &LZ4_streamHCPtr->internal_donotuse;
+
+	/* auto - init if forgotten */
+	if (ctxPtr->base == NULL)
+		LZ4HC_init(ctxPtr, (const BYTE *) source);
+
+	/* Check overflow */
+	if ((size_t)(ctxPtr->end - ctxPtr->base) > 2 * GB) {
+		size_t dictSize = (size_t)(ctxPtr->end - ctxPtr->base)
+			- ctxPtr->dictLimit;
+		if (dictSize > 64 * KB)
+			dictSize = 64 * KB;
+		LZ4_loadDictHC(LZ4_streamHCPtr,
+			(const char *)(ctxPtr->end) - dictSize, (int)dictSize);
+	}
+
+	/* Check if blocks follow each other */
+	if ((const BYTE *)source != ctxPtr->end)
+		LZ4HC_setExternalDict(ctxPtr, (const BYTE *)source);
+
+	/* Check overlapping input/dictionary space */
+	{
+		const BYTE *sourceEnd = (const BYTE *) source + inputSize;
+		const BYTE * const dictBegin = ctxPtr->dictBase + ctxPtr->lowLimit;
+		const BYTE * const dictEnd = ctxPtr->dictBase + ctxPtr->dictLimit;
+
+		if ((sourceEnd > dictBegin)
+			&& ((const BYTE *)source < dictEnd)) {
+			if (sourceEnd > dictEnd)
+				sourceEnd = dictEnd;
+			ctxPtr->lowLimit = (U32)(sourceEnd - ctxPtr->dictBase);
+
+			if (ctxPtr->dictLimit - ctxPtr->lowLimit < 4)
+				ctxPtr->lowLimit = ctxPtr->dictLimit;
+		}
+	}
+
+	return LZ4HC_compress_generic(ctxPtr, source, dest,
+		inputSize, maxOutputSize, ctxPtr->compressionLevel, limit);
+}
+
+int LZ4_compress_HC_continue(
+	LZ4_streamHC_t *LZ4_streamHCPtr,
+	const char *source,
+	char *dest,
+	int inputSize,
+	int maxOutputSize)
+{
+	if (maxOutputSize < LZ4_compressBound(inputSize))
+		return LZ4_compressHC_continue_generic(LZ4_streamHCPtr,
+			source, dest, inputSize, maxOutputSize, limitedOutput);
+	else
+		return LZ4_compressHC_continue_generic(LZ4_streamHCPtr,
+			source, dest, inputSize, maxOutputSize, noLimit);
+}
+EXPORT_SYMBOL(LZ4_compress_HC_continue);
+
+/* dictionary saving */
+
+int LZ4_saveDictHC(
+	LZ4_streamHC_t *LZ4_streamHCPtr,
+	char *safeBuffer,
+	int dictSize)
+{
+	LZ4HC_CCtx_internal *const streamPtr = &LZ4_streamHCPtr->internal_donotuse;
+	int const prefixSize = (int)(streamPtr->end
+		- (streamPtr->base + streamPtr->dictLimit));
+
+	if (dictSize > 64 * KB)
+		dictSize = 64 * KB;
+	if (dictSize < 4)
+		dictSize = 0;
+	if (dictSize > prefixSize)
+		dictSize = prefixSize;
+
+	memmove(safeBuffer, streamPtr->end - dictSize, dictSize);
+
+	{
+		U32 const endIndex = (U32)(streamPtr->end - streamPtr->base);
+
+		streamPtr->end = (const BYTE *)safeBuffer + dictSize;
+		streamPtr->base = streamPtr->end - endIndex;
+		streamPtr->dictLimit = endIndex - dictSize;
+		streamPtr->lowLimit = endIndex - dictSize;
+
+		if (streamPtr->nextToUpdate < streamPtr->dictLimit)
+			streamPtr->nextToUpdate = streamPtr->dictLimit;
+	}
+	return dictSize;
+}
+EXPORT_SYMBOL(LZ4_saveDictHC);
+
+/*-******************************
+ *	For backwards compatibility
+ ********************************/
+int lz4hc_compress(const unsigned char *src, size_t src_len,
+	unsigned char *dst, size_t *dst_len, void *wrkmem)
+{
+	*dst_len = LZ4_compress_HC(src, dst, src_len,
+		*dst_len, LZ4HC_DEFAULT_CLEVEL, wrkmem);
+
+	/*
+	 * Prior lz4hc_compress will return -1 in case of error
+	 * and 0 on success
+	 * while new LZ4_compress_HC
+	 * returns 0 in case of error
+	 * and the output length on success
+	 */
+	if (!*dst_len)
+		return -1;
+	else
+		return 0;
 }
 
 int LZ4_compress_HC(const char *src, char *dst, int srcSize,

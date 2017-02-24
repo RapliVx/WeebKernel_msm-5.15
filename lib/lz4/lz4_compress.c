@@ -446,7 +446,7 @@ _last_literals:
 			*op++ = (BYTE)(lastRun << ML_BITS);
 		}
 
-		LZ4_memcpy(op, anchor, lastRun);
+		memcpy(op, anchor, lastRun);
 
 		op += lastRun;
 	}
@@ -708,7 +708,7 @@ _last_literals:
 		} else {
 			*op++ = (BYTE)(lastRunSize<<ML_BITS);
 		}
-		LZ4_memcpy(op, anchor, lastRunSize);
+		memcpy(op, anchor, lastRunSize);
 		op += lastRunSize;
 	}
 
@@ -749,6 +749,212 @@ static int LZ4_compress_destSize_extState(
 				src, dst, srcSizePtr,
 				targetDstSize, tableType);
 	}
+}
+
+
+int LZ4_compress_destSize(
+	const char *src,
+	char *dst,
+	int *srcSizePtr,
+	int targetDstSize,
+	void *wrkmem)
+{
+	return LZ4_compress_destSize_extState(wrkmem, src, dst, srcSizePtr,
+		targetDstSize);
+}
+EXPORT_SYMBOL(LZ4_compress_destSize);
+
+/*-******************************
+ *	Streaming functions
+ ********************************/
+void LZ4_resetStream(LZ4_stream_t *LZ4_stream)
+{
+	memset(LZ4_stream, 0, sizeof(LZ4_stream_t));
+}
+
+int LZ4_loadDict(LZ4_stream_t *LZ4_dict,
+	const char *dictionary, int dictSize)
+{
+	LZ4_stream_t_internal *dict = &LZ4_dict->internal_donotuse;
+	const BYTE *p = (const BYTE *)dictionary;
+	const BYTE * const dictEnd = p + dictSize;
+	const BYTE *base;
+
+	if ((dict->initCheck)
+		|| (dict->currentOffset > 1 * GB)) {
+		/* Uninitialized structure, or reuse overflow */
+		LZ4_resetStream(LZ4_dict);
+	}
+
+	if (dictSize < (int)HASH_UNIT) {
+		dict->dictionary = NULL;
+		dict->dictSize = 0;
+		return 0;
+	}
+
+	if ((dictEnd - p) > 64 * KB)
+		p = dictEnd - 64 * KB;
+	dict->currentOffset += 64 * KB;
+	base = p - dict->currentOffset;
+	dict->dictionary = p;
+	dict->dictSize = (U32)(dictEnd - p);
+	dict->currentOffset += dict->dictSize;
+
+	while (p <= dictEnd - HASH_UNIT) {
+		LZ4_putPosition(p, dict->hashTable, byU32, base);
+		p += 3;
+	}
+
+	return dict->dictSize;
+}
+EXPORT_SYMBOL(LZ4_loadDict);
+
+static void LZ4_renormDictT(LZ4_stream_t_internal *LZ4_dict,
+	const BYTE *src)
+{
+	if ((LZ4_dict->currentOffset > 0x80000000) ||
+		((uptrval)LZ4_dict->currentOffset > (uptrval)src)) {
+		/* address space overflow */
+		/* rescale hash table */
+		U32 const delta = LZ4_dict->currentOffset - 64 * KB;
+		const BYTE *dictEnd = LZ4_dict->dictionary + LZ4_dict->dictSize;
+		int i;
+
+		for (i = 0; i < LZ4_HASH_SIZE_U32; i++) {
+			if (LZ4_dict->hashTable[i] < delta)
+				LZ4_dict->hashTable[i] = 0;
+			else
+				LZ4_dict->hashTable[i] -= delta;
+		}
+		LZ4_dict->currentOffset = 64 * KB;
+		if (LZ4_dict->dictSize > 64 * KB)
+			LZ4_dict->dictSize = 64 * KB;
+		LZ4_dict->dictionary = dictEnd - LZ4_dict->dictSize;
+	}
+}
+
+int LZ4_saveDict(LZ4_stream_t *LZ4_dict, char *safeBuffer, int dictSize)
+{
+	LZ4_stream_t_internal * const dict = &LZ4_dict->internal_donotuse;
+	const BYTE * const previousDictEnd = dict->dictionary + dict->dictSize;
+
+	if ((U32)dictSize > 64 * KB) {
+		/* useless to define a dictionary > 64 * KB */
+		dictSize = 64 * KB;
+	}
+	if ((U32)dictSize > dict->dictSize)
+		dictSize = dict->dictSize;
+
+	memmove(safeBuffer, previousDictEnd - dictSize, dictSize);
+
+	dict->dictionary = (const BYTE *)safeBuffer;
+	dict->dictSize = (U32)dictSize;
+
+	return dictSize;
+}
+EXPORT_SYMBOL(LZ4_saveDict);
+
+int LZ4_compress_fast_continue(LZ4_stream_t *LZ4_stream, const char *source,
+	char *dest, int inputSize, int maxOutputSize, int acceleration)
+{
+	LZ4_stream_t_internal *streamPtr = &LZ4_stream->internal_donotuse;
+	const BYTE * const dictEnd = streamPtr->dictionary
+		+ streamPtr->dictSize;
+
+	const BYTE *smallest = (const BYTE *) source;
+
+	if (streamPtr->initCheck) {
+		/* Uninitialized structure detected */
+		return 0;
+	}
+
+	if ((streamPtr->dictSize > 0) && (smallest > dictEnd))
+		smallest = dictEnd;
+
+	LZ4_renormDictT(streamPtr, smallest);
+
+	if (acceleration < 1)
+		acceleration = LZ4_ACCELERATION_DEFAULT;
+
+	/* Check overlapping input/dictionary space */
+	{
+		const BYTE *sourceEnd = (const BYTE *) source + inputSize;
+
+		if ((sourceEnd > streamPtr->dictionary)
+			&& (sourceEnd < dictEnd)) {
+			streamPtr->dictSize = (U32)(dictEnd - sourceEnd);
+			if (streamPtr->dictSize > 64 * KB)
+				streamPtr->dictSize = 64 * KB;
+			if (streamPtr->dictSize < 4)
+				streamPtr->dictSize = 0;
+			streamPtr->dictionary = dictEnd - streamPtr->dictSize;
+		}
+	}
+
+	/* prefix mode : source data follows dictionary */
+	if (dictEnd == (const BYTE *)source) {
+		int result;
+
+		if ((streamPtr->dictSize < 64 * KB) &&
+			(streamPtr->dictSize < streamPtr->currentOffset)) {
+			result = LZ4_compress_generic(
+				streamPtr, source, dest, inputSize,
+				maxOutputSize, limitedOutput, byU32,
+				withPrefix64k, dictSmall, acceleration);
+		} else {
+			result = LZ4_compress_generic(
+				streamPtr, source, dest, inputSize,
+				maxOutputSize, limitedOutput, byU32,
+				withPrefix64k, noDictIssue, acceleration);
+		}
+		streamPtr->dictSize += (U32)inputSize;
+		streamPtr->currentOffset += (U32)inputSize;
+		return result;
+	}
+
+	/* external dictionary mode */
+	{
+		int result;
+
+		if ((streamPtr->dictSize < 64 * KB) &&
+			(streamPtr->dictSize < streamPtr->currentOffset)) {
+			result = LZ4_compress_generic(
+				streamPtr, source, dest, inputSize,
+				maxOutputSize, limitedOutput, byU32,
+				usingExtDict, dictSmall, acceleration);
+		} else {
+			result = LZ4_compress_generic(
+				streamPtr, source, dest, inputSize,
+				maxOutputSize, limitedOutput, byU32,
+				usingExtDict, noDictIssue, acceleration);
+		}
+		streamPtr->dictionary = (const BYTE *)source;
+		streamPtr->dictSize = (U32)inputSize;
+		streamPtr->currentOffset += (U32)inputSize;
+		return result;
+	}
+}
+EXPORT_SYMBOL(LZ4_compress_fast_continue);
+
+/*-******************************
+ *	For backwards compatibility
+ ********************************/
+int lz4_compress(const unsigned char *src, size_t src_len, unsigned char *dst,
+	size_t *dst_len, void *wrkmem) {
+	*dst_len = LZ4_compress_default(src, dst, src_len,
+		*dst_len, wrkmem);
+
+	/*
+	 * Prior lz4_compress will return -1 in case of error
+	 * and 0 on success
+	 * while new LZ4_compress_fast/default
+	 * returns 0 in case of error
+	 * and the output length on success
+	 */
+	if (!*dst_len)
+		return -1;
+	else
+		return 0;
 }
 
 
