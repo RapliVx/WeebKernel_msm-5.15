@@ -76,9 +76,6 @@
 #include "uid16.h"
 
 #include <trace/hooks/sys.h>
-#include <linux/string_helpers.h>
-
-#define MOD_KERNEL_VERSION "5.15.123-android13-8-00044-g5682afbff3e0-ab11501453"
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
@@ -1294,21 +1291,6 @@ static int override_release(char __user *release, size_t len)
 	return ret;
 }
 
-static void override_custom_release(char __user *release, size_t len)
-{
-    char *buf;
-
-    buf = kstrdup_quotable_cmdline(current, GFP_KERNEL);
-    if (buf == NULL)
-        return;
-
-    if (strncmp(buf, "com.google.android.gms", 22) == 0) {
-            copy_to_user(release, MOD_KERNEL_VERSION, strlen(MOD_KERNEL_VERSION));
-    }
-
-    kfree(buf);
-}
-
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
 	struct new_utsname tmp;
@@ -1319,7 +1301,6 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;
 
-	override_custom_release(name->release, sizeof(name->release));
 	if (override_release(name->release, sizeof(name->release)))
 		return -EFAULT;
 	if (override_architecture(name))
